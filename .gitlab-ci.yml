@@ -1,0 +1,70 @@
+# Mirror of the GitHub Actions pipeline for GitLab (the specification names GitLab CI).
+# Triggers: MR -> lint + test; push to main -> + build/push (deploy: see TODO); tag v* -> release image.
+stages: [lint, test, build, push]
+
+default:
+  image: python:3.12-slim
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+.pip-cache: &pip-cache
+  cache:
+    key: pip-$CI_COMMIT_REF_SLUG
+    paths: [.cache/pip]
+
+lint:
+  stage: lint
+  <<: *pip-cache
+  script:
+    - pip install ruff==0.12.3
+    - cd backend && ruff check .
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG =~ /^v/
+
+test:
+  stage: test
+  <<: *pip-cache
+  services:
+    - name: postgis/postgis:16-3.4
+      alias: postgres
+    - name: redis:7-alpine
+      alias: redis
+  variables:
+    POSTGRES_USER: trailmaps
+    POSTGRES_PASSWORD: trailmaps
+    POSTGRES_DB: trailmaps_test
+    DATABASE_URL: postgresql+asyncpg://trailmaps:trailmaps@postgres:5432/trailmaps_test
+    REDIS_URL: redis://redis:6379/15
+  script:
+    - cd backend
+    - pip install -r requirements-dev.txt
+    - pytest --cov=app --cov-report=term --cov-report=xml --cov-fail-under=75
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    when: always
+    paths: [backend/coverage.xml]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG =~ /^v/
+
+build-and-push:
+  stage: push
+  image: docker:27
+  services: [docker:27-dind]
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - export TAG="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+    - docker build -t "$CI_REGISTRY_IMAGE/backend:$TAG" -t "$CI_REGISTRY_IMAGE/backend:latest" backend
+    - docker push "$CI_REGISTRY_IMAGE/backend:$TAG"
+    - docker push "$CI_REGISTRY_IMAGE/backend:latest"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG =~ /^v/
+# TODO deploy: staging on push to main, production on tag v* (needs your servers/runners and secrets).

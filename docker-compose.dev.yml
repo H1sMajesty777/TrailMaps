@@ -1,0 +1,19 @@
+# Local development: HTTP only, Swagger enabled, DB/Redis exposed on localhost.
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
+  redis:
+    ports:
+      - "127.0.0.1:6379:6379"
+  backend:
+    environment:
+      ENVIRONMENT: dev
+      LOG_JSON: "false"
+  migrate:
+    environment:
+      ENVIRONMENT: dev
+  nginx:
+    volumes:
+      - ./nginx/templates-dev:/etc/nginx/templates:ro

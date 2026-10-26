@@ -1,0 +1,166 @@
+name: trailmaps
+
+x-backend-env: &backend-env
+  ENVIRONMENT: ${ENVIRONMENT:-production}
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+  OSRM_URL: http://osrm:5000
+  JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+  CORS_ORIGINS: ${CORS_ORIGINS:-}
+  UPLOAD_DIR: /var/www/uploads
+  WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+  BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+  BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-admin}
+  BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [internal]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$REDIS_PASSWORD redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [internal]
+
+  # One-shot job: applies Alembic migrations before the backend starts.
+  migrate:
+    build: ./backend
+    image: trailmaps-backend:local
+    command: ["alembic", "upgrade", "head"]
+    environment: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks: [internal]
+
+  backend:
+    build: ./backend
+    image: trailmaps-backend:local
+    restart: unless-stopped
+    environment: *backend-env
+    volumes:
+      - uploads_data:/var/www/uploads
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks: [internal]
+
+  # --- OSRM: download extract -> build pedestrian graph -> serve ---
+  osrm-download:
+    image: curlimages/curl:8.10.1
+    user: root
+    command:
+      - sh
+      - -c
+      - '[ -f /data/map.osm.pbf ] || curl -fL --retry 3 -o /data/map.osm.pbf "$${OSRM_PBF_URL}"'
+    environment:
+      OSRM_PBF_URL: ${OSRM_PBF_URL:-https://download.geofabrik.de/europe/monaco-latest.osm.pbf}
+    volumes:
+      - osrm_data:/data
+    restart: "no"
+    networks: [edge]
+
+  osrm-prepare:
+    image: osrm/osrm-backend:v5.27.1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        [ -f /data/map.osrm.mldgr ] ||
+        (osrm-extract -p /opt/foot.lua /data/map.osm.pbf &&
+        osrm-partition /data/map.osrm && osrm-customize /data/map.osrm)
+    volumes:
+      - osrm_data:/data
+    depends_on:
+      osrm-download:
+        condition: service_completed_successfully
+    restart: "no"
+    networks: [internal]
+
+  osrm:
+    image: osrm/osrm-backend:v5.27.1
+    restart: unless-stopped
+    command: ["osrm-routed", "--algorithm", "mld", "--max-viaroute-size", "100", "/data/map.osrm"]
+    volumes:
+      - osrm_data:/data:ro
+    depends_on:
+      osrm-prepare:
+        condition: service_completed_successfully
+    networks: [internal]
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    environment:
+      SERVER_NAME: ${SERVER_NAME:-localhost}
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - ./nginx/snippets:/etc/nginx/snippets:ro
+      - uploads_data:/var/www/uploads:ro
+      - frontend_dist:/usr/share/nginx/html:ro
+      - certs:/etc/letsencrypt:ro
+      - certbot_webroot:/var/www/certbot:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [internal, edge]
+
+  # Let's Encrypt renewal loop. Enable with: docker compose --profile tls up -d certbot
+  certbot:
+    image: certbot/certbot:v2.11.0
+    profiles: ["tls"]
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c", "trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot; sleep 12h & wait $${!}; done"]
+    volumes:
+      - certs:/etc/letsencrypt
+      - certbot_webroot:/var/www/certbot
+    networks: [edge]
+
+  # React build output is expected in the `frontend_dist` volume (see backend/README.md).
+  # frontend:
+  #   build: ./frontend
+  #   volumes: [frontend_dist:/dist]
+
+volumes:
+  postgres_data:
+  redis_data:
+  uploads_data:
+  osrm_data:
+  frontend_dist:
+  certs:
+  certbot_webroot:
+
+networks:
+  # No outbound access, not reachable from outside: Postgres, Redis, OSRM and the API live here.
+  internal:
+    internal: true
+  # Only nginx (published ports) and one-shot downloaders are attached to this one.
+  edge:
