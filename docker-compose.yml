@@ -87,7 +87,7 @@ services:
     networks: [edge]
 
   osrm-prepare:
-    image: osrm/osrm-backend:v5.27.1
+    image: ghcr.io/project-osrm/osrm-backend:latest
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
@@ -103,7 +103,7 @@ services:
     networks: [internal]
 
   osrm:
-    image: osrm/osrm-backend:v5.27.1
+    image: ghcr.io/project-osrm/osrm-backend:latest
     restart: unless-stopped
     command: ["osrm-routed", "--algorithm", "mld", "--max-viaroute-size", "100", "/data/map.osrm"]
     volumes:
